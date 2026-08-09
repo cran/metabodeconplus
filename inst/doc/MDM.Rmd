@@ -1,0 +1,197 @@
+---
+title: "Model Fitting"
+output:
+  rmarkdown::html_vignette: default
+  pdf_document:
+    latex_engine: xelatex
+header-includes:
+  - \usepackage{fontspec}
+  - \usepackage{etoolbox}
+  - \usepackage{fvextra}
+  - \usepackage{needspace}
+  - \definecolor{shadecolor}{RGB}{232,232,232}
+  - \fvset{breaklines=true,breakanywhere=true}
+  - \BeforeBeginEnvironment{Shaded}{\Needspace{10\baselineskip}}
+  - \BeforeBeginEnvironment{Shaded}{\vspace{0.5em}}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines=true,breakanywhere=true,commandchars=\\\{\}}
+  - \RecustomVerbatimEnvironment{verbatim}{Verbatim}{breaklines=true,breakanywhere=true}
+css: styles.css
+vignette: >
+  %\VignetteIndexEntry{Model Fitting}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r set-defaults, echo=FALSE, results=FALSE, message=FALSE}
+knitr::opts_chunk$set(
+    fig.dim=c(5, 5), fig.show="hold", out.width="50%",
+    echo=TRUE, message=FALSE, warning=FALSE
+)
+```
+
+This article shows how to turn raw one-dimensional NMR spectra into a trained
+classifier with `metabodeconplus`, following the same pipeline described in the
+paper:
+
+1. **Deconvolution** -- represent each spectrum as a list of Lorentzian peaks.
+2. **Alignment (CluPA)** -- shift peaks so corresponding peaks across spectra
+   share the same chemical-shift index.
+3. **Reference snapping** -- snap each aligned peak onto the nearest
+   reference-grid column, so all spectra share one common set of feature
+   columns.
+4. **Feature matrix** -- collapse the snapped peak lists into one row per
+   spectrum.
+5. **Classification** -- fit a random forest with
+   [`ranger`](https://cran.r-project.org/package=ranger).
+
+`fit_mdm()` runs all five steps in one call; below we first do them by hand so
+each intermediate state is visible, and then reproduce the result with the
+one-shot call. We use the bundled `sim2` dataset.
+
+# Load spectra
+
+`sim2` contains 100 simulated 1D NMR spectra split evenly into groups `A` and
+`B`. Five of every 25 peaks per spectrum differ between groups by 10 % in area.
+The group labels are attached as an attribute; see `?sim2` for details.
+
+```{r load-spectra}
+library(metabodeconplus)
+x <- sim2
+y <- attr(sim2, "group")
+n <- length(x)
+```
+
+We use one half of the data for training and one half for testing.
+
+```{r split}
+set.seed(1)
+tr <- sort(sample(n, round(0.5 * n)))
+te <- setdiff(seq_len(n), tr)
+true_x0 <- attr(sim2, "true_x0")   # ppm of the discriminating peaks
+```
+
+# The pipeline, step by step
+
+We pick a small group-balanced subset (4 + 4 spectra) just for the plots; the
+model itself is trained on all of `x[tr]`.
+
+```{r prep}
+abtr <- c(which(y[tr] == "A")[1:4], which(y[tr] == "B")[1:4])
+yab <- y[tr][abtr]
+```
+
+## Step 1: Deconvolute
+
+`deconvolute()` models each spectrum as a superposition of Lorentzian peaks.
+
+```{r decon}
+decons <- deconvolute(x[tr], nfit=10, smit=2, smws=5, delta=10, npmax=0, verbose=FALSE)
+plot_spectra(decons[abtr])
+heat_spectra(decons[abtr], y=yab)
+```
+
+## Step 2: Align (CluPA)
+
+`clupa()` shifts each spectrum's peaks toward a reference spectrum using the
+hierarchical cluster-based peak alignment (CluPA) algorithm. It picks the
+reference automatically and attaches it, so we can reuse it for the test data.
+
+```{r align}
+aligns <- clupa(decons, maxShift=50, verbose=FALSE)
+ref <- attr(aligns, "ref")
+plot_spectra(aligns[abtr])
+```
+
+## Step 3: Snap peaks to the reference
+
+CluPA aligns peaks continuously; `snap_to_ref()` then snaps each peak onto the
+nearest reference-grid column (within `maxCombine` datapoints), so every
+spectrum ends up described by the *same* set of feature columns.
+
+```{r snap}
+snapped <- snap_to_ref(aligns, maxCombine=5)
+```
+
+## Step 4: Build the feature matrix
+
+`peak_mat()` rasterises the snapped peak lists into a matrix with one row per
+spectrum and one column per populated reference-grid position. `peakPos`
+records which columns are populated -- these are the features the model sees.
+
+```{r featmat}
+X <- peak_mat(snapped)
+peakPos <- attr(X, "peakPos")
+dim(X)
+heat_spectra(X, y=y[tr], true_x0=true_x0)
+heat_spectra(X, y=y[tr], true_x0=true_x0, scale_cols=TRUE)
+```
+
+The standardized view (`scale_cols=TRUE`) makes the group structure visible:
+columns near `true_x0` show consistent sign differences between A (top) and B
+(bottom).
+
+## Step 5: Fit a random forest
+
+We fit a probability random forest on the feature matrix with `ranger` and read
+off the out-of-bag (OOB) error.
+
+```{r ranger, eval=TRUE}
+rf <- ranger::ranger(x=X, y=y[tr], probability=TRUE, num.trees=500, seed=1)
+cat(sprintf("OOB error: %.1f%%\n", 100 * rf$prediction.error))
+```
+
+# The one-shot call
+
+`fit_mdm()` performs all five steps -- deconvolute, align, snap, featurize,
+fit -- and, when any of `npmax` / `maxShift` / `maxCombine` is a vector,
+searches the grid and returns the best model. Choose the backend with
+`model = "ranger"`.
+
+```{r fit-mdm, eval=TRUE}
+md <- fit_mdm(x[tr], y[tr], model="ranger",
+              npmax=0L, maxShift=50L, maxCombine=5L,
+              verbosity=0, nworkers=1)
+print(md)
+```
+
+# Predict held-out spectra
+
+`predict()` on an `mdm` object mirrors the training pipeline for new data,
+reusing the stored reference and feature columns.
+
+```{r predict, eval=TRUE}
+# Small rank-based AUC helper (positive class = second factor level).
+auc <- function(y, prob) {
+    pos <- y == levels(y)[2]; r <- rank(prob)
+    n1 <- sum(pos); n0 <- sum(!pos)
+    if (n1 == 0 || n0 == 0) NA_real_ else (sum(r[pos]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+preds <- predict(md, x[te], type="all", verbosity=0)
+acc <- mean(preds$class == y[te])
+au  <- auc(y[te], preds$prob)
+cat(sprintf("Test accuracy: %.1f%%\n", 100 * acc))
+cat(sprintf("Test AUC:      %.3f\n", au))
+```
+
+# Tune the preprocessing
+
+Passing a vector for `npmax`, `maxShift` or `maxCombine` makes `fit_mdm()`
+evaluate the cartesian product and keep the best-scoring cell (accuracy, ties
+broken by AUC). The augmented grid is returned in `md$mog`.
+
+```{r tune, eval=TRUE}
+mt <- fit_mdm(x[tr], y[tr], model="ranger",
+              npmax=c(0L, 30L), maxShift=c(20L, 50L), maxCombine=c(2L, 5L),
+              verbosity=0, nworkers=1)
+knitr::kable(head(mt$mog[order(-mt$mog$auc), ], 5), row.names=FALSE,
+             caption="Top parameter combinations by AUC.")
+```
+
+For an honest generalization estimate on small datasets, wrap the whole search
+in outer cross-validation with `benchmark()` (not run here because it repeats
+the grid search for every fold):
+
+```{r benchmark, eval=FALSE}
+bm <- benchmark(x, y, model="ranger", npmax=0L, maxShift=50L, maxCombine=5L, k=5)
+mean(bm$predictions$true == bm$predictions$pred)
+```
