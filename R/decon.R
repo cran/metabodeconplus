@@ -144,6 +144,21 @@ is_npmax <- function(x) is_int(x, 1) && x >= -2L
 # except `0` (the literal-params mode).
 npmax_needs_deg <- function(npmax) isTRUE(npmax != 0L)
 
+# Whether `fit_mdm_internal()` / `benchmark_internal()` must attach the
+# `$deg` grids before running their model grid. Attaching them is a slow
+# per-spectrum grid search, so it is skipped when nothing reads them:
+# `npmax=-1` resolution (find_npmax_elbow) always does, `identity2`
+# never does (it discards the deconvolution) and `deconvolute_spectra()`
+# does for every npmax except `0` (see npmax_needs_deg). `npmax` may be
+# a vector; any other `decon_fun` is a black box and assumed to need
+# them.
+decon_needs_deg <- function(decon_fun, npmax) {
+    if (any(npmax == -1L)) return(TRUE)
+    if (identical(decon_fun, identity2)) return(FALSE)
+    if (identical(decon_fun, deconvolute_spectra)) return(any(npmax != 0L))
+    TRUE
+}
+
 # Per-spectrum npmax elbow from the (np, cum-min ar) frontier of `s$deg`.
 # Same Kneedle-on-cum-min-frontier idea as `mdp::find_ellbow` but returns
 # only the np at the knee. `s$deg` must be populated upstream (typically
@@ -774,29 +789,31 @@ lorentz_int <- function(x0, A, lambda, lcpar = NULL, limits = NULL) {
 #' @title Calculate the PRARP Score
 #'
 #' @description
-#' Calculates the PRARP score for a deconvolution. The PRARP score is the
-#' product of the peak ratio and the area ratio and can be used to assess the
-#' quality of a deconvolution. See 'Details' for more information on how the
-#' score is calculated.
+#' Calculates the PRARP and PRARPX scores for a deconvolution. Both combine a
+#' peak term with the area ratio and can be used to assess the quality of a
+#' deconvolution. See 'Details' for how they are calculated.
 #'
-#' @param decon A list containing the deconvolution results, as returned by
+#' @param x A deconvolution, as returned by
 #' [metabodeconplus::generate_lorentz_curves()].
 #'
-#' @param lcpar A data frame containing the true parameters of the peaks.
+#' @param truepar A list of the true peak parameters (`x0`, `A`, `lambda`).
+#' Defaults to `x$meta$simpar`.
 #'
-#' @return The PRARP score as numeric scalar. In addition, a plot is created to
-#' visualize the deconvolution results.
+#' @return A named list with `prarpx`, `prarp`, both peak ratios, the peak
+#' counts and the areas.
 #'
 #' @details
-#' The PRARP score is calculated as follows:
+#' The scores are calculated as follows:
 #'
-#' peak_ratio = min(peaks_true, peaks_found) / max(peaks_true, peaks_found)
-#' area_ratio = min(area_true,  area_found)  / max(area_true,  area_found)
-#' prarp      = peak_ratio * area_ratio
+#' peak_ratio   = min(np_found, np_true) / max(np_found, np_true)
+#' peak_ratio_x = np_correct / (np_true + np_wrong)
+#' area_ratio   = sum(|residual|) / sum(|spectrum|)
+#' prarp        = peak_ratio   * max(0, 1 - area_ratio)
+#' prarpx       = peak_ratio_x * max(0, 1 - area_ratio)
 #'
-#' I.e., the score is close to 1 if the number of peaks and the area of the
-#' peaks are similar in the true and found spectra and the score is close to 0
-#' if the number of peaks and/or the area of the peaks are very different.
+#' I.e., a score is close to 1 if the right peaks were found and the
+#' reconstruction matches the spectrum, and 0 if the residual is at least as
+#' large as the spectrum.
 #'
 #' @author 2024-2025 Tobias Schmidt: initial version.
 #'
@@ -833,8 +850,8 @@ calc_prarp <- function(x, truepar = NULL, ...) {
     area_residuals <- sum(abs(obj$sit$sup - obj$si))
     area_ratio <- area_residuals / area_spectrum
 
-    prarp <- peak_ratio * (1 - area_ratio)
-    prarpx <- peak_ratio_x * (1 - area_ratio)
+    prarp <- peak_ratio * max(0, 1 - area_ratio)
+    prarpx <- peak_ratio_x * max(0, 1 - area_ratio)
 
     named(
         prarpx, prarp, peak_ratio_x, peak_ratio,

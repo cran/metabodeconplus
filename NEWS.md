@@ -1,3 +1,44 @@
+# metabodeconplus 0.22.4
+
+* Added a citation entry: `citation("metabodeconplus")` now returns Schmidt et al. (2026), Metabolites 16(9):604, <doi:10.3390/metabo16090604>, and Haeckl et al. (2021) for the original algorithm.
+
+* The package description, README and Model Fitting article now reference Schmidt et al. (2026).
+
+* README now presents CRAN as the stable source and GitHub as the development version, and links the Model Fitting and Datasets articles.
+
+* Documentation fixes: titles and vignettes now say metabodeconplus instead of Metabodecon, and the Contributing article describes how to run the tests, install the package and prepare a release.
+
+* CI: bumped GitHub Actions versions and allowed manual runs of R-CMD-check.
+
+* Fixed the internal test helper `run_tests()`, which aborted because it tried to mock the no longer existing function `assert()`.
+
+# metabodeconplus 0.22.3
+
+* `snap_to_ref()` no longer returns a zero-column feature matrix when it
+  is handed spectra that did not pass through `clupa()`. It already
+  derived a missing `pcial` for the reference spectrum but not for the
+  others, so every non-reference peak snapped to `NA` and `si_mat()`
+  dropped it -- silently, with no error. The same fallback now applies
+  to every spectrum. Results on the normal path are unchanged, since
+  `clupa()` always sets `pcial`.
+
+# metabodeconplus 0.22.2
+
+* Runtime improvement: `fit_mdm()` and `benchmark()` now skip the
+  up-front `$deg` grid search when no pipeline stage reads it, i.e. for
+  `npmax = 0` (literal deconvolution parameters) and for
+  `decon_fun = identity2`, where `benchmark()` previously re-ran the
+  whole grid search once per outer fold and discarded the result. No
+  result changes anywhere; only non-default configurations are affected.
+  `decon_fun` is not reachable through the exported API (`identity2` is
+  internal), so of the two only `npmax = 0` can be triggered by a public
+  `fit_mdm()` / `benchmark()` call; the default `npmax = -1` still needs
+  the grid.
+
+# metabodeconplus 0.22.1
+
+* Improvement: make `calc_prarp()` clamp both scores at zero, so `prarp` and `prarpx` stay in `[0, 1]`. Practically irrelevant, because the residual is never bigger than the spectrum area for any reasonable deconvolution, but makes the implementation match the theoretical formulation.
+
 # metabodeconplus 0.22.0
 
 * CRAN resubmission addressing the review of 0.21.0, which still saw changes
